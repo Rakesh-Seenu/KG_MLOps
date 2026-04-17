@@ -3,12 +3,7 @@ api/schemas.py
 ──────────────────────────────────────────────────────────────────────────────
 Pydantic schemas for the FastAPI endpoints.
 
-🎓 WHAT IS PYDANTIC?
-  Pydantic validates data using Python type hints.
-  - Automatically validates request JSON against the schema
-  - Returns friendly error messages if input is wrong
-  - Generates JSON Schema → FastAPI uses this for /docs auto-documentation
-  - Industry standard for Python API development
+PrimeKG uses native integer indexes for node referencing.
 """
 
 from pydantic import BaseModel, Field
@@ -18,28 +13,34 @@ from typing import Optional
 class PredictRequest(BaseModel):
     """Request body for POST /predict"""
 
-    head_entity: str = Field(
+    head_index: int = Field(
         ...,
-        description="The source entity in the knowledge graph",
-        example="Disease::MESH:D003920",
+        description="The source node integer index in PrimeKG",
+        example=42,
     )
     relation: str = Field(
         ...,
         description="The relation type to predict over",
-        example="GNBR::T::Compound:Disease",
+        example="indication",
+    )
+    predicted_type: Optional[str] = Field(
+        default=None,
+        description="Filter results down to a specific node_type (e.g. 'disease' or 'drug')",
+        example="disease"
     )
     top_k: int = Field(
         default=10,
-        ge=1,       # ge = greater than or equal to
-        le=100,     # le = less than or equal to
+        ge=1,       
+        le=100,     
         description="Number of predictions to return",
     )
 
     class Config:
         json_schema_extra = {
             "example": {
-                "head_entity": "Disease::MESH:D003920",
-                "relation": "GNBR::T::Compound:Disease",
+                "head_index": 42,
+                "relation": "indication",
+                "predicted_type": "disease",
                 "top_k": 10,
             }
         }
@@ -47,27 +48,25 @@ class PredictRequest(BaseModel):
 
 class PredictionItem(BaseModel):
     """A single link prediction result."""
-    entity: str = Field(..., description="Predicted entity name")
-    entity_type: str = Field(..., description="Entity type (Gene, Disease, Compound, etc.)")
+    node_index: int = Field(..., description="Predicted Entity Node Index")
     score: float = Field(..., description="Prediction confidence score (higher = more likely)")
     rank: int = Field(..., description="Rank of this prediction (1 = highest confidence)")
 
 
 class PredictResponse(BaseModel):
     """Response from POST /predict"""
-    head_entity: str
+    head_index: int
     relation: str
     predictions: list[PredictionItem]
     
     class Config:
         json_schema_extra = {
             "example": {
-                "head_entity": "Disease::MESH:D003920",
-                "relation": "GNBR::T::Compound:Disease",
+                "head_index": 42,
+                "relation": "indication",
                 "predictions": [
                     {
-                        "entity": "Compound::DB00678",
-                        "entity_type": "Compound",
+                        "node_index": 10984,
                         "score": 9.34,
                         "rank": 1,
                     }
@@ -81,5 +80,5 @@ class HealthResponse(BaseModel):
     status: str
     model_loaded: bool
     device: str
-    n_entities: int
+    n_nodes: int
     n_relations: int

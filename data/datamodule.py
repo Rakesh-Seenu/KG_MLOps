@@ -1,7 +1,7 @@
 """
 data/datamodule.py
 ──────────────────────────────────────────────────────────────────────────────
-PyTorch Lightning DataModule for the DRKG knowledge graph.
+PyTorch Lightning DataModule for the PrimeKG knowledge graph.
 
 🎓 WHAT IS A LightningDataModule?
   It's a class that organizes all your data logic in one place:
@@ -9,10 +9,6 @@ PyTorch Lightning DataModule for the DRKG knowledge graph.
   - train_dataloader(): return training batches
   - val_dataloader(): return validation batches
   - test_dataloader(): return test batches
-
-  WHY? Because in distributed training (multiple GPUs), Lightning
-  calls setup() on each GPU worker. Having a DataModule ensures
-  every GPU gets the right data without duplicating code.
 """
 
 import json
@@ -20,6 +16,7 @@ from pathlib import Path
 from typing import Optional
 
 import numpy as np
+import pandas as pd
 import torch
 from torch.utils.data import Dataset, DataLoader
 import lightning as L
@@ -32,35 +29,25 @@ DATA_DIR = Path(__file__).parent / "processed"
 class TripleDataset(Dataset):
     """
     PyTorch Dataset for knowledge graph triples.
-    
-    🎓 PyTorch Dataset Protocol:
-    Any Dataset must implement:
-      __len__():      return total number of samples
-      __getitem__(i): return the i-th sample as tensors
-    
-    DataLoader will call these to build batches.
+    Returns (head_id, relation_id, tail_id) tensors.
     """
 
     def __init__(self, triples: np.ndarray):
-        """
-        Args:
-            triples: (N, 3) array of [head_id, relation_id, tail_id]
-        """
-        self.triples = torch.LongTensor(triples)  # LongTensor = int64, required for embedding lookup
+        self.triples = torch.LongTensor(triples)
 
     def __len__(self) -> int:
         return len(self.triples)
 
     def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         triple = self.triples[idx]
-        return triple[0], triple[1], triple[2]  # head, relation, tail
+        return triple[0], triple[1], triple[2]
 
 
-class DRKGDataModule(L.LightningDataModule):
+class PrimeKGDataModule(L.LightningDataModule):
     """
-    LightningDataModule for the DRKG dataset.
-    
-    Handles loading integer-encoded triples and creating DataLoaders.
+    LightningDataModule for the PrimeKG dataset.
+    Loads processed Parquet files and creates 80/10/10 splits dynamically
+    if specific splits aren't provided.
     """
 
     def __init__(
@@ -68,7 +55,6 @@ class DRKGDataModule(L.LightningDataModule):
         data_dir: Path = DATA_DIR,
         batch_size: int = 1024,
         num_workers: int = 4,
-        # For fast testing, use only a fraction of the data
         train_fraction: float = 1.0,
     ):
         super().__init__()
@@ -77,72 +63,52 @@ class DRKGDataModule(L.LightningDataModule):
         self.num_workers = num_workers
         self.train_fraction = train_fraction
 
-        # These are set in setup()
         self.train_dataset: Optional[TripleDataset] = None
         self.val_dataset: Optional[TripleDataset] = None
         self.test_dataset: Optional[TripleDataset] = None
-        self.n_entities: int = 0
+        self.max_node_index: int = 0
         self.n_relations: int = 0
 
     def prepare_data(self):
-        """
-        Called once to check data exists.
-        Do NOT assign state here (this runs only on rank 0 in distributed training).
-        """
-        required = ["train.tsv", "valid.tsv", "test.tsv", "entity2id.json", "relation2id.json"]
+        """Check if preprocessed data exists."""
+        required = ["primekg_edges.parquet", "relation2id.json", "stats.json"]
         for fname in required:
             path = self.data_dir / fname
             if not path.exists():
-                raise FileNotFoundError(
-                    f"Missing: {path}\n"
-                    f"Run: python data/preprocess.py"
-                )
+                raise FileNotFoundError(f"Missing: {path}\nRun: python data/preprocess.py")
 
     def setup(self, stage: Optional[str] = None):
-        """
-        Load data and create datasets. Called on ALL GPU workers.
+        """Load Parquet data, split it, and create datasets."""
+        with open(self.data_dir / "stats.json") as f:
+            stats = json.load(f)
         
-        🎓 STAGES:
-        - "fit"    → called before training (loads train + val)
-        - "test"   → called before testing (loads test)
-        - "predict"→ called before prediction
-        - None     → load everything
-        """
-        # Load entity and relation mappings
-        with open(self.data_dir / "entity2id.json") as f:
-            entity2id = json.load(f)
-        with open(self.data_dir / "relation2id.json") as f:
-            relation2id = json.load(f)
+        self.max_node_index = stats["max_node_index"]
+        self.n_relations = stats["n_relations"]
+        logger.info(f"📊 Dataset stats: {self.max_node_index+1:,} max node ID, {self.n_relations:,} relations")
 
-        self.n_entities = len(entity2id)
-        self.n_relations = len(relation2id)
+        # Load edges from Parquet
+        logger.info("Loading PrimeKG edges into memory...")
+        df = pd.read_parquet(self.data_dir / "primekg_edges.parquet")
+        
+        # We need head_index, relation_id, tail_index
+        triples = df[['head_index', 'relation_id', 'tail_index']].to_numpy(dtype=np.int64)
+        
+        # Shuffle explicitly using a fixed seed for reproducible splits
+        np.random.seed(42)
+        np.random.shuffle(triples)
+        
+        n = len(triples)
+        n_train = int(n * 0.8)
+        n_valid = int(n * 0.1)
 
-        logger.info(f"📊 Dataset stats: {self.n_entities:,} entities, {self.n_relations:,} relations")
-
-        def load_split(filename: str) -> np.ndarray:
-            """Load a TSV split and convert entity/relation names to integer IDs."""
-            rows = []
-            with open(self.data_dir / filename) as f:
-                for line in f:
-                    parts = line.strip().split("\t")
-                    if len(parts) != 3:
-                        continue
-                    head, relation, tail = parts
-                    # Skip if any entity/relation is unknown (shouldn't happen after preprocessing)
-                    if head not in entity2id or tail not in entity2id or relation not in relation2id:
-                        continue
-                    rows.append([entity2id[head], relation2id[relation], entity2id[tail]])
-            return np.array(rows, dtype=np.int64)
+        train_triples = triples[:n_train]
+        val_triples = triples[n_train:n_train + n_valid]
+        test_triples = triples[n_train + n_valid:]
 
         if stage in ("fit", None):
-            train_triples = load_split("train.tsv")
-            val_triples = load_split("valid.tsv")
-
-            # Optionally subsample training data for fast prototyping
             if self.train_fraction < 1.0:
                 n_keep = int(len(train_triples) * self.train_fraction)
-                idx = np.random.choice(len(train_triples), n_keep, replace=False)
-                train_triples = train_triples[idx]
+                train_triples = train_triples[:n_keep]
                 logger.warning(f"⚡ Using {self.train_fraction:.0%} of training data: {len(train_triples):,} triples")
 
             self.train_dataset = TripleDataset(train_triples)
@@ -150,24 +116,23 @@ class DRKGDataModule(L.LightningDataModule):
             logger.info(f"   Train: {len(self.train_dataset):,} | Val: {len(self.val_dataset):,}")
 
         if stage in ("test", None):
-            test_triples = load_split("test.tsv")
             self.test_dataset = TripleDataset(test_triples)
-            logger.info(f"   Test: {len(self.test_dataset):,}")
+            logger.info(f"   Test:  {len(self.test_dataset):,}")
 
     def train_dataloader(self) -> DataLoader:
         return DataLoader(
             self.train_dataset,
             batch_size=self.batch_size,
-            shuffle=True,           # Shuffle training data every epoch
+            shuffle=True,
             num_workers=self.num_workers,
-            pin_memory=True,        # Faster GPU data transfer
-            drop_last=True,         # Drop incomplete last batch for stable training
+            pin_memory=True,
+            drop_last=True,
         )
 
     def val_dataloader(self) -> DataLoader:
         return DataLoader(
             self.val_dataset,
-            batch_size=self.batch_size * 2,  # Larger batch = faster validation
+            batch_size=self.batch_size * 2,
             shuffle=False,
             num_workers=self.num_workers,
             pin_memory=True,

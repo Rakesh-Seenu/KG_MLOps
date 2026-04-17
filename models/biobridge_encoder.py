@@ -1,252 +1,130 @@
 """
 models/biobridge_encoder.py
 ──────────────────────────────────────────────────────────────────────────────
-Wraps the BioBridge pre-trained model to generate rich biomedical embeddings.
+BioBridge Multimodal Encoder for PrimeKG Link Prediction.
 
-🎓 WHAT YOU'LL LEARN:
+Unlike DRKG where we ran BiomedBERT from scratch, BioBridge gives us 
+PRECOMPUTED embeddings for nodes using their best modalities:
+- Proteins: ESM-2b sequence embeddings (2560-dim)
+- Drugs: SMILES structured embeddings (512-dim)
+- Diseases/Phenotypes: PubMedBERT text embeddings (768-dim)
 
-1. WHAT IS BioBridge?
-   - A 2024 NeurIPS paper from Stanford
-   - It "bridges" different biomedical data modalities into ONE embedding space:
-     • Text descriptions    →  768-dim vector
-     • Protein sequences    →  768-dim vector  
-     • Drug SMILES strings  →  768-dim vector
-   - This means a gene described in text and a protein sequence can be
-     compared directly! This is multi-modal learning.
-
-2. WHAT IS BiomedBERT?
-   - Microsoft's BERT model pre-trained on 21 million biomedical abstracts
-   - Much better than regular BERT for bio/pharma text
-   - BioBridge uses it as its text encoder
-
-3. WHY USE EMBEDDINGS FOR KG LINK PREDICTION?
-   - Raw entity IDs like "Gene::9606/23210" carry NO semantic information
-   - But the text "BRCA1 is a tumor suppressor gene involved in DNA repair"
-     is rich with meaning
-   - BioBridge embeddings give our model a HEAD START from pre-trained knowledge
-
-4. TRANSFER LEARNING:
-   - We DON'T train BioBridge from scratch (that needs 21M papers + months)
-   - We use the pre-trained weights and just FINE-TUNE for our task
-   - This is why large pre-trained models are so powerful in practice
+This module loads these multimodal embeddings and projects them into a 
+unified dimension (e.g., 768) so they can interact in our KGE model.
 """
 
-import json
-import hashlib
+import pickle
 from pathlib import Path
-from typing import Optional
+from typing import Dict, Tuple
 
-import numpy as np
 import torch
+import torch.nn as nn
 from loguru import logger
-from tqdm import tqdm
-from transformers import AutoModel, AutoTokenizer
 
+DATA_DIR = Path(__file__).parent.parent / "data" / "raw" / "biobridge"
+EMBEDDINGS_DIR = DATA_DIR / "embeddings"
 
-# ── Constants ─────────────────────────────────────────────────────────────────
-BIOBRIDGE_MODEL = "microsoft/BiomedNLP-BiomedBERT-base-uncased-abstract-fulltext"
-# Note: The full BioBridge model is at "QSong5/BioBridge" on HuggingFace
-# We use BiomedBERT directly as the text encoder — same underlying model.
-
-EMBEDDING_DIM = 768  # BiomedBERT outputs 768-dimensional vectors
-CACHE_DIR = Path(__file__).parent.parent / "data" / "embeddings_cache"
-BATCH_SIZE = 64      # Process 64 entities at a time to fit in GPU memory
-
-
-class BioBridgeEncoder:
+class BioBridgeProjector(nn.Module):
     """
-    Encodes biomedical entities (genes, diseases, drugs) into dense vectors.
+    Combines pre-computed multimodal embeddings and unifies their dimensions.
     
-    Usage:
-        encoder = BioBridgeEncoder()
-        entity_names = ["BRCA1 breast cancer gene", "Ibuprofen anti-inflammatory"]
-        embeddings = encoder.encode(entity_names)  # shape: (2, 768)
+    If a node is a protein (2560d), it gets projected to `target_dim`.
+    If a node is a drug (512d), it gets projected up to `target_dim`.
+    Missing nodes get standard trainable embeddings.
     """
 
-    def __init__(
-        self,
-        model_name: str = BIOBRIDGE_MODEL,
-        device: Optional[str] = None,
-        cache_embeddings: bool = True,
-    ):
-        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-        self.cache_embeddings = cache_embeddings
-        self.model_name = model_name
+    def __init__(self, max_node_index: int, target_dim: int = 768):
+        super().__init__()
+        self.target_dim = target_dim
+        self.max_node_index = max_node_index
 
-        logger.info(f"🧬 Loading BioBridge encoder: {model_name}")
-        logger.info(f"   Device: {self.device}")
+        logger.info(f"🧬 Initializing BioBridge Projector (Target Dim: {target_dim})")
 
-        # Load tokenizer and model from HuggingFace Hub
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
-        self.model = AutoModel.from_pretrained(model_name)
-        self.model = self.model.to(self.device)
-        self.model.eval()  # IMPORTANT: eval mode disables dropout for inference
-
-        CACHE_DIR.mkdir(parents=True, exist_ok=True)
-        logger.success("✅ BioBridge encoder loaded!")
-
-    def _get_cache_path(self, text: str) -> Path:
-        """Generate a unique cache filename based on the text hash."""
-        text_hash = hashlib.md5(text.encode()).hexdigest()
-        return CACHE_DIR / f"{text_hash}.npy"
-
-    def encode_single(self, text: str) -> np.ndarray:
-        """
-        Encode a single text string into a 768-dim embedding.
+        # 1. Base embedding for ALL nodes (trainable fallback for nodes without BioBridge vectors)
+        self.base_embeddings = nn.Embedding(max_node_index + 1, target_dim)
         
-        🎓 HOW BERT ENCODING WORKS:
-        1. Tokenizer splits text into subword tokens
-           "BRCA1" → ["BR", "##CA", "##1"]  (subword tokenization)
-        2. Model processes tokens through 12 transformer layers
-        3. We take the [CLS] token embedding as the sentence representation
-           [CLS] is the special "summary" token at position 0
+        # 2. Modality specific linear projections (to align them to target_dim)
+        self.protein_proj = nn.Linear(2560, target_dim)
+        self.drug_proj = nn.Linear(512, target_dim)
+        self.disease_proj = nn.Linear(768, target_dim) # Even if 768->768, a map helps align spaces
+
+        # Track which nodes belong to which modality
+        self.register_buffer("protein_mask", torch.zeros(max_node_index + 1, dtype=torch.bool))
+        self.register_buffer("drug_mask", torch.zeros(max_node_index + 1, dtype=torch.bool))
+        self.register_buffer("disease_mask", torch.zeros(max_node_index + 1, dtype=torch.bool))
+
+        # Modality embedding stores (frozen or finely tuned)
+        self.protein_embs = nn.Parameter(torch.zeros(max_node_index + 1, 2560), requires_grad=False)
+        self.drug_embs = nn.Parameter(torch.zeros(max_node_index + 1, 512), requires_grad=False)
+        self.disease_embs = nn.Parameter(torch.zeros(max_node_index + 1, 768), requires_grad=False)
+
+    def load_pretrained_mappings(self):
         """
-        cache_path = self._get_cache_path(text)
-
-        # Check cache first — avoids re-computing for same entities
-        if self.cache_embeddings and cache_path.exists():
-            return np.load(cache_path)
-
-        # Tokenize: convert text → input IDs + attention mask
-        inputs = self.tokenizer(
-            text,
-            return_tensors="pt",
-            max_length=128,         # Truncate very long texts
-            padding="max_length",   # Pad short texts
-            truncation=True,
-        ).to(self.device)
-
-        # Forward pass through BiomedBERT
-        with torch.no_grad():  # no_grad: don't compute gradients during inference
-            outputs = self.model(**inputs)
-
-        # Extract [CLS] token embedding: shape (1, 768) → (768,)
-        cls_embedding = outputs.last_hidden_state[:, 0, :].squeeze().cpu().numpy()
-
-        # Cache for future use
-        if self.cache_embeddings:
-            np.save(cache_path, cls_embedding)
-
-        return cls_embedding
-
-    def encode(self, texts: list[str], show_progress: bool = True) -> np.ndarray:
+        Loads the .pkl dictionaries into memory and populates the embedding buffers.
+        Requires that python data/download_biobridge.py has been executed.
         """
-        Encode a list of texts in batches.
-        
-        Batching is crucial for GPU efficiency:
-        - GPU excels at parallel matrix operations
-        - Processing one text at a time wastes 99% of GPU capacity
-        - With batch_size=64, we process 64 texts simultaneously
-        
-        Returns:
-            np.ndarray of shape (len(texts), 768)
+        logger.info("Loading BioBridge .pkl embeddings into PyTorch buffers...")
+
+        def _load_dict(filename: str, emb_buffer: nn.Parameter, mask_buffer: torch.Tensor, expected_dim: int):
+            path = EMBEDDINGS_DIR / filename
+            if not path.exists():
+                logger.warning(f"Embedding file {filename} not found.")
+                return 0
+
+            with open(path, 'rb') as f:
+                data = pickle.load(f)
+
+            count = 0
+            for node_idx, vector in data.items():
+                if node_idx <= self.max_node_index:
+                    if len(vector) == expected_dim:
+                        emb_buffer.data[node_idx] = torch.tensor(vector, dtype=torch.float32)
+                        mask_buffer[node_idx] = True
+                        count += 1
+            logger.info(f"   Loaded {count:,} vectors from {filename}")
+            return count
+
+        p_count = _load_dict("protein.pkl", self.protein_embs, self.protein_mask, 2560)
+        dr_count = _load_dict("drug.pkl", self.drug_embs, self.drug_mask, 512)
+        di_count = _load_dict("disease.pkl", self.disease_embs, self.disease_mask, 768)
+
+        total_loaded = p_count + dr_count + di_count
+        logger.success(f"✅ Loaded {total_loaded:,} pre-computed BioBridge embeddings!")
+
+    def forward(self, node_indices: torch.Tensor) -> torch.Tensor:
         """
-        all_embeddings = []
+        Returns the unified embeddings for the given nodes.
         
-        iterator = range(0, len(texts), BATCH_SIZE)
-        if show_progress:
-            iterator = tqdm(iterator, desc="Encoding entities", unit="batch")
+        Algorithm:
+        1. Look up base trainable embedding.
+        2. If node is a protein, add projected BioBridge protein vector.
+        3. If node is a drug, add projected BioBridge drug vector.
+        4. If node is a disease, add projected BioBridge disease vector.
+        """
+        out = self.base_embeddings(node_indices)
 
-        for batch_start in iterator:
-            batch_texts = texts[batch_start:batch_start + BATCH_SIZE]
+        # Get modality masks for the requested batch
+        p_mask = self.protein_mask[node_indices]
+        dr_mask = self.drug_mask[node_indices]
+        di_mask = self.disease_mask[node_indices]
 
-            # Check which texts need encoding (rest are cached)
-            uncached_texts = []
-            uncached_indices = []
-            batch_embeddings = [None] * len(batch_texts)
+        # Apply projections only where masks are true (saves computation)
+        if p_mask.any():
+            out[p_mask] += self.protein_proj(self.protein_embs[node_indices[p_mask]])
+            
+        if dr_mask.any():
+            out[dr_mask] += self.drug_proj(self.drug_embs[node_indices[dr_mask]])
+            
+        if di_mask.any():
+            out[di_mask] += self.disease_proj(self.disease_embs[node_indices[di_mask]])
 
-            for i, text in enumerate(batch_texts):
-                cache_path = self._get_cache_path(text)
-                if self.cache_embeddings and cache_path.exists():
-                    batch_embeddings[i] = np.load(cache_path)
-                else:
-                    uncached_texts.append(text)
-                    uncached_indices.append(i)
-
-            # Batch encode uncached texts
-            if uncached_texts:
-                inputs = self.tokenizer(
-                    uncached_texts,
-                    return_tensors="pt",
-                    max_length=128,
-                    padding=True,
-                    truncation=True,
-                ).to(self.device)
-
-                with torch.no_grad():
-                    outputs = self.model(**inputs)
-
-                # Shape: (batch_size, sequence_length, 768) → (batch_size, 768)
-                cls_embeddings = outputs.last_hidden_state[:, 0, :].cpu().numpy()
-
-                for i, (idx, emb) in enumerate(zip(uncached_indices, cls_embeddings)):
-                    batch_embeddings[idx] = emb
-                    if self.cache_embeddings:
-                        np.save(self._get_cache_path(uncached_texts[i]), emb)
-
-            all_embeddings.extend(batch_embeddings)
-
-        return np.array(all_embeddings)  # Shape: (N, 768)
-
-
-def encode_drkg_entities(data_dir: Path = None) -> np.ndarray:
-    """
-    Encodes all DRKG entities using BioBridge.
-    
-    DRKG entity format: "TypeName::EntityID"
-    We use the entity ID as the text input, cleaned up for readability.
-    
-    Example:
-        "Gene::9606/23210"  →  tokenize as "Gene 23210"
-        "Disease::MESH:D003920"  →  tokenize as "Disease MESH D003920"
-    
-    For a production system, you'd look up the actual names from a biomedical
-    database like UniProt (proteins) or PubChem (compounds). That's a 
-    great extension for your PhD application portfolio!
-    """
-    data_dir = data_dir or Path(__file__).parent.parent / "data" / "processed"
-    entity2id_path = data_dir / "entity2id.json"
-
-    if not entity2id_path.exists():
-        logger.error("entity2id.json not found. Run data/preprocess.py first.")
-        raise FileNotFoundError(entity2id_path)
-
-    with open(entity2id_path) as f:
-        entity2id = json.load(f)
-
-    # Sort by ID to get consistent ordering
-    entities_sorted = sorted(entity2id.items(), key=lambda x: x[1])
-    entity_names = [e[0] for e in entities_sorted]
-
-    # Clean entity names for better tokenization
-    def clean_entity_name(name: str) -> str:
-        """Convert "Gene::9606/23210" → "Gene 23210" for BiomedBERT."""
-        parts = name.split("::", 1)
-        if len(parts) == 2:
-            entity_type, entity_id = parts
-            # Clean up the ID
-            entity_id = entity_id.replace("/", " ").replace("_", " ").replace(":", " ")
-            return f"{entity_type} {entity_id}"
-        return name
-
-    cleaned_names = [clean_entity_name(e) for e in entity_names]
-    logger.info(f"📊 Encoding {len(cleaned_names):,} DRKG entities with BioBridge...")
-    logger.info(f"   Examples: {cleaned_names[:3]}")
-
-    encoder = BioBridgeEncoder()
-    embeddings = encoder.encode(cleaned_names)
-
-    # Save embeddings
-    output_path = data_dir / "entity_embeddings.npy"
-    np.save(output_path, embeddings)
-    logger.success(f"✅ Saved {embeddings.shape} embedding matrix to {output_path}")
-    logger.info(f"   Size on disk: {output_path.stat().st_size / (1024**2):.1f} MB")
-
-    return embeddings
-
+        return out
 
 if __name__ == "__main__":
-    embeddings = encode_drkg_entities()
-    logger.info(f"\n🎉 Entity embeddings shape: {embeddings.shape}")
-    logger.info(f"   Each entity is a {embeddings.shape[1]}-dimensional vector")
-    logger.info(f"   These are the STARTING POINT for our KGE model!")
+    # Test execution
+    dummy_encoder = BioBridgeProjector(max_node_index=130000, target_dim=768)
+    dummy_encoder.load_pretrained_mappings()
+    
+    sample_nodes = torch.tensor([0, 10, 1000])
+    embeddings = dummy_encoder(sample_nodes)
+    print(f"Sample Embeddings Shape: {embeddings.shape}")
