@@ -37,7 +37,8 @@ class BioBridgeGNNDataModule(pl.LightningDataModule):
         """
         if self.graph_path.exists():
             logger.info(f"🚀 Loading Real BioBridge Graph from {self.graph_path}...")
-            self.data = torch.load(self.graph_path)
+            # weights_only=False is required for PyTorch 2.6+ to load complex PyG objects
+            self.data = torch.load(self.graph_path, weights_only=False)
         else:
             logger.info("🛠️  Graph .pt file not found. Building real HeteroData from Parquet...")
             self.data = self._build_from_processed()
