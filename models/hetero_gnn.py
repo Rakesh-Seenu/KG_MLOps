@@ -13,18 +13,24 @@ class HeteroGNN(torch.nn.Module):
     def __init__(self, hidden_channels: int = 64, num_layers: int = 2):
         super().__init__()
         self.convs = torch.nn.ModuleList()
+        self.relus = torch.nn.ModuleList()
+        self.dropouts = torch.nn.ModuleList()
+        
         # Note: input channel is -1 for lazy initialization (infers dynamically from data)
-        self.convs.append(SAGEConv((-1, -1), hidden_channels))
-        for _ in range(num_layers - 1):
+        for _ in range(num_layers):
             self.convs.append(SAGEConv((-1, -1), hidden_channels))
+            self.relus.append(torch.nn.ReLU())
+            self.dropouts.append(torch.nn.Dropout(p=0.2))
 
     def forward(self, x, edge_index):
-        # We loop through our layers and apply ReLU activations
-        for conv in self.convs[:-1]:
-            x = conv(x, edge_index)
-            x = F.relu(x)
-            x = F.dropout(x, p=0.2, training=self.training)
-        # Last layer
+        # We loop through our layers and apply ReLU activations 
+        # Using module-based ReLU/Dropout is safer for to_hetero FX tracing
+        for i in range(len(self.convs) - 1):
+            x = self.convs[i](x, edge_index)
+            x = self.relus[i](x)
+            x = self.dropouts[i](x)
+            
+        # Last layer (no activation or dropout usually for latent embeddings)
         return self.convs[-1](x, edge_index)
 
 

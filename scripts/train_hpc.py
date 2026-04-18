@@ -7,6 +7,11 @@ potentially multiple compute nodes and multiple GPUs seamlessly.
 """
 
 import os
+import sys
+
+# Ensure the root project directory is in the Python path so local imports work
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 import torch
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping, RichProgressBar

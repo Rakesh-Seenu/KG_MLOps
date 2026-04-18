@@ -55,6 +55,17 @@ class BioBridgeGNNDataModule(pl.LightningDataModule):
             dst_dis = torch.randint(0, 500, (4000,))
             self.data['drug', 'treats', 'disease'].edge_index = torch.stack([src_drug, dst_dis], dim=0)
 
+            # --- CRITICAL FIX: Add Reverse Edges ---
+            # To_hetero requires all node types to be updated. We add reverse edges
+            # so that 'drug' nodes receive messages from 'disease' nodes.
+            self.data['disease', 'rev_treats', 'drug'].edge_index = torch.stack([dst_dis, src_drug], dim=0)
+            
+            # Connect genes to drugs so 'gene' nodes are also updated
+            src_gene = torch.randint(0, 5000, (2000,))
+            dst_drug = torch.randint(0, 1000, (2000,))
+            self.data['gene', 'interacts', 'drug'].edge_index = torch.stack([src_gene, dst_drug], dim=0)
+            self.data['drug', 'rev_interacts', 'gene'].edge_index = torch.stack([dst_drug, src_gene], dim=0)
+
         # Step 3: Train/val/test splitting strategies & Negative Sampling
         # RandomLinkSplit takes out edges for validation and testing to prevent data leakage.
         transform = RandomLinkSplit(
@@ -62,7 +73,7 @@ class BioBridgeGNNDataModule(pl.LightningDataModule):
             num_test=0.1,
             disjoint_train_ratio=0.3, # Edges hidden during message passing for training supervision
             edge_types=[self.target_edge_type], 
-            rev_edge_types=[("disease", "rev_treats", "drug")] if ("disease", "rev_treats", "drug") in self.data.edge_types else None, 
+            rev_edge_types=[("disease", "rev_treats", "drug")], 
             add_negative_train_samples=False, # We'll do dynamic negative sampling inside dataloader
             neg_sampling_ratio=1.0 # 1 negative edge for every 1 positive edge
         )
