@@ -3,6 +3,7 @@ import torch.nn.functional as F
 import pytorch_lightning as pl
 from torch_geometric.nn import SAGEConv, to_hetero
 import torchmetrics
+from models.biobridge_encoder import BioBridgeProjector
 
 class HeteroGNN(torch.nn.Module):
     """
@@ -67,7 +68,10 @@ class BioBridgeLinkPredictor(pl.LightningModule):
         self.save_hyperparameters()
         self.target_edge_type = target_edge_type
         
-        # 1. Instantiate the Base GNN
+        # 1. BioBridge Modal Encoder (Projects real ESM-2b/PubMedBERT vectors)
+        self.projector = BioBridgeProjector(target_dim=hidden_channels)
+        
+        # 2. Instantiate the Base GNN
         base_gnn = HeteroGNN(hidden_channels=hidden_channels, num_layers=2)
         
         # 2. "Heterogenize" it: This magic function creates a separate unique
@@ -82,9 +86,15 @@ class BioBridgeLinkPredictor(pl.LightningModule):
         self.val_auroc = torchmetrics.AUROC(task="binary")
 
     def forward(self, batch):
-        # Pass node features and edge indices into the HeteroGNN
-        # Returns a dictionary of updated node embeddings: { 'gene': tensor(...), 'disease': tensor(...) }
-        z_dict = self.encoder(batch.x_dict, batch.edge_index_dict)
+        # 1. Multimodal Projection (BioBridge)
+        # We project the specific nodes present in the current mini-batch
+        x_dict = {}
+        for node_type in batch.node_types:
+            # Look up embeddings based on global_id
+            x_dict[node_type] = self.projector.forward_for_type(node_type, batch[node_type].global_id)
+            
+        # 2. Pass into the HeteroGNN
+        z_dict = self.encoder(x_dict, batch.edge_index_dict)
         return z_dict
 
     def _step(self, batch, batch_idx, mode="train"):
