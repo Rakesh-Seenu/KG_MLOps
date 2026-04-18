@@ -86,20 +86,22 @@ class BioBridgeLinkPredictor(pl.LightningModule):
         self.val_auroc = torchmetrics.AUROC(task="binary")
 
     def forward(self, batch):
-        # 1. Multimodal Projection (BioBridge)
+        # 1. Device Synchronization (CRITICAL for full-graph inference)
+        # Ensure the graph/batch is on the same device as the model (GPU or CPU)
+        batch = batch.to(self.device)
+
+        # 2. Multimodal Projection (BioBridge)
         x_dict = {}
         for node_type in batch.node_types:
-            # Check if this is a mini-batch (n_id exists) or the full graph (inference)
             if hasattr(batch[node_type], 'n_id'):
                 indices = batch[node_type].n_id
             else:
-                # Full graph inference fallback (useful for UMAP/Visualization)
                 num_nodes = batch[node_type].num_nodes
                 indices = torch.arange(num_nodes, device=self.device)
             
             x_dict[node_type] = self.projector.forward_for_type(node_type, indices)
             
-        # 2. Pass into the HeteroGNN
+        # 3. Pass into the HeteroGNN
         z_dict = self.encoder(x_dict, batch.edge_index_dict)
         return z_dict
 
