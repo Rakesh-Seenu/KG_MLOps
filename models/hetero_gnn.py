@@ -87,12 +87,16 @@ class BioBridgeLinkPredictor(pl.LightningModule):
 
     def forward(self, batch):
         # 1. Multimodal Projection (BioBridge)
-        # We project the specific nodes present in the current mini-batch
         x_dict = {}
         for node_type in batch.node_types:
-            # batch[node_type].n_id contains the original index of the node in the FULL HeteroData object
-            # This aligns perfectly with our projector's embedding buffers.
-            indices = batch[node_type].n_id
+            # Check if this is a mini-batch (n_id exists) or the full graph (inference)
+            if hasattr(batch[node_type], 'n_id'):
+                indices = batch[node_type].n_id
+            else:
+                # Full graph inference fallback (useful for UMAP/Visualization)
+                num_nodes = batch[node_type].num_nodes
+                indices = torch.arange(num_nodes, device=self.device)
+            
             x_dict[node_type] = self.projector.forward_for_type(node_type, indices)
             
         # 2. Pass into the HeteroGNN
