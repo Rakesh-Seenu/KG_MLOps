@@ -90,8 +90,10 @@ class BioBridgeLinkPredictor(pl.LightningModule):
         # We project the specific nodes present in the current mini-batch
         x_dict = {}
         for node_type in batch.node_types:
-            # Look up embeddings based on global_id
-            x_dict[node_type] = self.projector.forward_for_type(node_type, batch[node_type].global_id)
+            # batch[node_type].n_id contains the original index of the node in the FULL HeteroData object
+            # This aligns perfectly with our projector's embedding buffers.
+            indices = batch[node_type].n_id
+            x_dict[node_type] = self.projector.forward_for_type(node_type, indices)
             
         # 2. Pass into the HeteroGNN
         z_dict = self.encoder(x_dict, batch.edge_index_dict)
