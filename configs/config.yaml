@@ -1,0 +1,34 @@
+# BioKG PrimeKG Link Prediction Configuration
+# ──────────────────────────────────────────────────────────────────────────────
+
+paths:
+  data_dir: "data/processed"
+  raw_dir: "data/raw/primekg"
+  checkpoint_dir: "checkpoints"
+  mlflow_dir: "mlruns"
+
+model:
+  embed_dim: 384
+  gamma: 12.0
+  lr: 0.0005
+  n_negative_samples: 256
+  use_biobridge: true
+
+training:
+  batch_size: 256
+  num_workers: 2
+  train_fraction: 0.1
+  max_epochs: 50
+  precision: "16-mixed"
+  gradient_clip_val: 1.0
+  val_check_interval: 1.0
+  log_every_n_steps: 50
+
+mlflow:
+  experiment_name: "BioKG-PrimeKG-LinkPrediction"
+  run_name: "rotate_biobridge_primekg_elite_v1"
+
+app:
+  title: "🧬 BioKG PrimeKG Link Predictor"
+  theme_hue: "fuchsia"
+  default_top_k: 10

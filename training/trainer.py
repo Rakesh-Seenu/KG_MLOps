@@ -5,8 +5,15 @@ Main training script using PyTorch Lightning + MLflow for PrimeKG link predictio
 """
 
 import json
+import yaml
+import sys
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Any, Dict
+
+# ── Path Initialization ───────────────────────────────────────────────────────
+PROJECT_ROOT = Path(__file__).parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.append(str(PROJECT_ROOT))
 
 import mlflow
 import lightning as L
@@ -22,69 +29,24 @@ from loguru import logger
 from data.datamodule import PrimeKGDataModule
 from models.kge_model import RotatEModel
 
-# ── Paths ─────────────────────────────────────────────────────────────────────
+# ── Project Root Discovery ───────────────────────────────────────────────────
 PROJECT_ROOT = Path(__file__).parent.parent
-DATA_DIR = PROJECT_ROOT / "data" / "processed"
-CHECKPOINT_DIR = PROJECT_ROOT / "checkpoints"
-MLFLOW_DIR = PROJECT_ROOT / "mlruns"
+DEFAULT_CONFIG = PROJECT_ROOT / "configs" / "config.yaml"
 
-# ── Hyperparameters ────────────────────────────────────────────────────────────
-CONFIG = {
-    "batch_size": 1024,
-    "num_workers": 4,
-    "train_fraction": 1.0, 
+def load_config(config_path: Path = DEFAULT_CONFIG) -> Dict[str, Any]:
+    """Load and validate the YAML configuration."""
+    if not config_path.exists():
+        logger.error(f"Config file not found: {config_path}")
+        raise FileNotFoundError(config_path)
+        
+    with open(config_path, "r") as f:
+        return yaml.safe_load(f)
 
-    # Model
-    "embed_dim": 384,        
-    "gamma": 12.0,           
-    "n_negative_samples": 256,
-    "use_biobridge": True, 
-
-    # Training
-    "lr": 5e-4,
-    "max_epochs": 50,
-    "precision": "16-mixed",  
-    "gradient_clip_val": 1.0,  
-
-    # MLflow
-    "experiment_name": "BioKG-PrimeKG-LinkPrediction",
-    "run_name": "rotate_biobridge_primekg_v1",
-}
-
-
-def train(config: dict = CONFIG, checkpoint_path: Optional[str] = None):
-    logger.info("🚀 Starting PrimeKG Training Pipeline")
-    logger.info("=" * 60)
-    logger.info(json.dumps(config, indent=2))
-
-    logger.info("\n📊 Setting up PrimeKG DataModule...")
-    datamodule = PrimeKGDataModule(
-        data_dir=DATA_DIR,
-        batch_size=config["batch_size"],
-        num_workers=config["num_workers"],
-        train_fraction=config["train_fraction"],
-    )
-    datamodule.prepare_data()
-    datamodule.setup("fit")
-
-    logger.info("\n🧠 Building RotatE model...")
-    model = RotatEModel(
-        max_node_idx=datamodule.max_node_index,
-        n_relations=datamodule.n_relations,
-        embed_dim=config["embed_dim"],
-        gamma=config["gamma"],
-        lr=config["lr"],
-        n_negative_samples=config["n_negative_samples"],
-        use_biobridge=config["use_biobridge"]
-    )
-
-    logger.info(f"   Parameters: {sum(p.numel() for p in model.parameters()):,}")
-
-    CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
-
-    callbacks = [
+def setup_callbacks(config: Dict[str, Any], checkpoint_dir: Path) -> list:
+    """Initialize standard training callbacks."""
+    return [
         ModelCheckpoint(
-            dirpath=CHECKPOINT_DIR,
+            dirpath=checkpoint_dir,
             filename="primekg-{epoch:02d}-{val/loss:.3f}",
             monitor="val/loss",
             mode="min",
@@ -101,52 +63,93 @@ def train(config: dict = CONFIG, checkpoint_path: Optional[str] = None):
         RichProgressBar(),
     ]
 
-    MLFLOW_DIR.mkdir(parents=True, exist_ok=True)
+def train(config_path: Optional[str] = None):
+    """
+    Main entry point for the PrimeKG Training Pipeline.
+    
+    This script encapsulates the full MLOps workflow:
+    1. Configuration loading & validation.
+    2. DataModule initialization (ETL).
+    3. Model architecture instantiation.
+    4. Experiment tracking integration (MLflow).
+    5. GPU-accelerated training via Lightning.
+    """
+    # 1. Configuration
+    raw_config = load_config(Path(config_path) if config_path else DEFAULT_CONFIG)
+    
+    logger.info("🚀 Starting PrimeKG Elite Training Pipeline")
+    logger.info(f"Loaded config: {json.dumps(raw_config, indent=2)}")
+
+    # Paths from config
+    paths = raw_config["paths"]
+    data_dir = PROJECT_ROOT / paths["data_dir"]
+    checkpoint_dir = PROJECT_ROOT / paths["checkpoint_dir"]
+    mlflow_dir = PROJECT_ROOT / paths["mlflow_dir"]
+    
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    mlflow_dir.mkdir(parents=True, exist_ok=True)
+
+    # 2. Data (ETL)
+    train_cfg = raw_config["training"]
+    logger.info("📊 Initializing PrimeKG DataModule...")
+    datamodule = PrimeKGDataModule(
+        data_dir=data_dir,
+        batch_size=train_cfg["batch_size"],
+        num_workers=train_cfg["num_workers"],
+        train_fraction=train_cfg["train_fraction"],
+    )
+    datamodule.prepare_data()
+    datamodule.setup("fit")
+
+    # 3. Model Architecture
+    model_cfg = raw_config["model"]
+    logger.info("🧠 Building industry-standard RotatE model...")
+    model = RotatEModel(
+        max_node_idx=datamodule.max_node_index,
+        n_relations=datamodule.n_relations,
+        embed_dim=model_cfg["embed_dim"],
+        gamma=model_cfg["gamma"],
+        lr=model_cfg["lr"],
+        n_negative_samples=model_cfg["n_negative_samples"],
+        use_biobridge=model_cfg["use_biobridge"]
+    )
+
+    # 4. MLflow Logging
+    mf_cfg = raw_config["mlflow"]
     mlflow_logger = MLFlowLogger(
-        experiment_name=config["experiment_name"],
-        run_name=config["run_name"],
-        tracking_uri=f"file://{MLFLOW_DIR.resolve()}",
+        experiment_name=mf_cfg["experiment_name"],
+        run_name=mf_cfg["run_name"],
+        tracking_uri=mlflow_dir.resolve().as_uri(),
         log_model=True,
     )
 
-    mlflow_logger.log_hyperparams(config)
-
-    logger.info("\n⚡ Configuring PyTorch Lightning Trainer...")
+    # 5. Trainer Orchestration
+    callbacks = setup_callbacks(raw_config, checkpoint_dir)
+    
+    logger.info("⚡ Configuring PyTorch Lightning Trainer...")
     trainer = L.Trainer(
-        max_epochs=config["max_epochs"],
+        max_epochs=train_cfg["max_epochs"],
         accelerator="gpu" if __import__("torch").cuda.is_available() else "cpu",
         devices=1,
-        precision=config["precision"],
-        gradient_clip_val=config["gradient_clip_val"],
+        precision=train_cfg["precision"],
+        gradient_clip_val=train_cfg["gradient_clip_val"],
         callbacks=callbacks,
         logger=mlflow_logger,
-        log_every_n_steps=50,
-        val_check_interval=0.5,
+        log_every_n_steps=train_cfg["log_every_n_steps"],
+        val_check_interval=train_cfg["val_check_interval"],
         enable_progress_bar=True,
-        enable_model_summary=True,
     )
 
-    logger.info("\n🏋️  Starting training...")
-    trainer.fit(
-        model,
-        datamodule=datamodule,
-        ckpt_path=checkpoint_path,
-    )
+    # 6. Execution
+    logger.info("🏋️  Starting training...")
+    trainer.fit(model, datamodule=datamodule)
 
-    logger.info("\n🧪 Running PyTorch Lightning Test Loop...")
-    trainer.test(
-        model,
-        datamodule=datamodule,
-        ckpt_path="best"
-    )
+    # 7. Post-Training Validation
+    logger.info("🧪 Running final test suite...")
+    trainer.test(model, datamodule=datamodule, ckpt_path="best")
 
-    logger.success(f"\n🎉 Training complete!")
-    logger.info(f"   Best checkpoint: {trainer.checkpoint_callback.best_model_path}")
-    logger.info(f"   Best val loss: {trainer.checkpoint_callback.best_model_score:.4f}")
-    logger.info(f"\n   View MLflow UI: mlflow ui --backend-store-uri {MLFLOW_DIR.resolve()}")
-
+    logger.success(f"🎉 Training complete! Best model: {trainer.checkpoint_callback.best_model_path}")
     return trainer.checkpoint_callback.best_model_path
-
 
 if __name__ == "__main__":
     best_model_path = train()

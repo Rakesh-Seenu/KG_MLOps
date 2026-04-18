@@ -75,12 +75,37 @@ class BioBridgeProjector(nn.Module):
                 data = pickle.load(f)
 
             count = 0
-            for node_idx, vector in data.items():
-                if node_idx <= self.max_node_index:
-                    if len(vector) == expected_dim:
-                        emb_buffer.data[node_idx] = torch.tensor(vector, dtype=torch.float32)
-                        mask_buffer[node_idx] = True
-                        count += 1
+            
+            # ── Senior Engineer Check: Handle Columnar Format ──────────────────
+            # The pickle is a dict with keys: ['node_index', 'node_id', 'node_name', 'embedding']
+            if isinstance(data, dict) and 'node_index' in data and 'embedding' in data:
+                indices = data['node_index']
+                vectors = data['embedding']
+                
+                for idx_raw, vector in zip(indices, vectors):
+                    try:
+                        node_idx = int(idx_raw)
+                        if node_idx <= self.max_node_index:
+                            if len(vector) == expected_dim:
+                                emb_buffer.data[node_idx] = torch.tensor(vector, dtype=torch.float32)
+                                mask_buffer[node_idx] = True
+                                count += 1
+                    except (ValueError, TypeError):
+                        continue
+            
+            # ── Fallback: Handle Direct Mapping Format ───────────────────────
+            else:
+                for node_idx_raw, vector in data.items():
+                    try:
+                        node_idx = int(node_idx_raw)
+                        if node_idx <= self.max_node_index:
+                            if len(vector) == expected_dim:
+                                emb_buffer.data[node_idx] = torch.tensor(vector, dtype=torch.float32)
+                                mask_buffer[node_idx] = True
+                                count += 1
+                    except (ValueError, TypeError):
+                        continue
+            
             logger.info(f"   Loaded {count:,} vectors from {filename}")
             return count
 
